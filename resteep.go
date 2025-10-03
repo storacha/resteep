@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -170,8 +171,20 @@ func reload(mainPackage string, modelData []byte) error {
 		return fmt.Errorf("go not found in PATH: %w", err)
 	}
 
+	args := []string{"go", "run"}
+
+	// Preserve build tags
+	info, ok := debug.ReadBuildInfo()
+	if ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "-tags" {
+				args = append(args, "-tags", setting.Value)
+			}
+		}
+	}
+
 	encodedModelData := base64.StdEncoding.EncodeToString(modelData)
-	err = syscall.Exec(goPath, []string{"go", "run", mainPackage}, append(os.Environ(), fmt.Sprintf("RESTEEP_MODEL=%s", encodedModelData)))
+	err = syscall.Exec(goPath, append(args, mainPackage), append(os.Environ(), fmt.Sprintf("RESTEEP_MODEL=%s", encodedModelData)))
 	if err != nil {
 		return fmt.Errorf("exec failed: %w", err)
 	}
