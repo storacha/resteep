@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/term"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -23,8 +24,10 @@ type ResteepableModel interface {
 type reloadMsg struct{}
 
 type wrapperModel struct {
-	inner        ResteepableModel
-	shouldReload bool
+	inner             ResteepableModel
+	mainPackage       string
+	input             *os.File
+	previousTermState *term.State
 }
 
 func (m wrapperModel) Init() tea.Cmd {
@@ -34,8 +37,17 @@ func (m wrapperModel) Init() tea.Cmd {
 func (m wrapperModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg.(type) {
 	case reloadMsg:
-		m.shouldReload = true
-		return m, tea.Quit
+		modelData, err := m.inner.Marshal()
+		if err != nil {
+			panic(fmt.Sprintf("failed to marshal model: %v", err))
+		}
+
+		term.Restore(os.Stdin.Fd(), m.previousTermState)
+		if err := reload(m.mainPackage, modelData); err != nil {
+			panic(fmt.Sprintf("failed to reload: %v", err))
+		}
+
+		return nil, nil // never reached
 	}
 
 	newInner, cmd := m.inner.Update(msg)
@@ -60,7 +72,28 @@ func Resteep(createModel func([]byte) ResteepableModel, opts ...tea.ProgramOptio
 		}
 		model = createModel(data)
 	}
-	program := tea.NewProgram(wrapperModel{inner: model}, opts...)
+
+	// We're assuming stdin is a tty here. Bubble Tea is more flexible than that,
+	// but we're not handling that yet.
+	input := os.Stdin
+
+	// Save the current terminal state so we can restore it just before reloading.
+	// Bubble Tea will restore state itself on exit, but allowing the Bubble Tea
+	// program to completely exit is too slow, and causes a flicker.
+	previousTermState, err := term.GetState(input.Fd())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get terminal state: %w", err)
+	}
+
+	program := tea.NewProgram(
+		wrapperModel{
+			inner:             model,
+			mainPackage:       mainPackage,
+			input:             input,
+			previousTermState: previousTermState,
+		},
+		opts...,
+	)
 
 	root, err := os.Getwd()
 	if err != nil {
@@ -81,19 +114,7 @@ func Resteep(createModel func([]byte) ResteepableModel, opts ...tea.ProgramOptio
 		return nil, err
 	}
 
-	wrappedFinalModel := finalModel.(wrapperModel)
-	if wrappedFinalModel.shouldReload {
-		modelData, err := wrappedFinalModel.inner.Marshal()
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal model: %w", err)
-		}
-
-		if err := reload(mainPackage, modelData); err != nil {
-			return nil, fmt.Errorf("failed to reload: %w", err)
-		}
-	}
-
-	return wrappedFinalModel.inner, nil
+	return finalModel.(wrapperModel).inner, nil
 }
 
 func watchGoFilesInDir(dir string, cb func() error) (func() error, error) {
