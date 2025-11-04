@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -186,6 +187,23 @@ func addDirs(watcher *fsnotify.Watcher, root string) error {
 	})
 }
 
+// setEnvVar removes any existing entry for key and adds key=value
+func setEnvVar(env []string, key, value string) []string {
+	result := make([]string, 0, len(env)+1)
+	prefix := key + "="
+
+	// Copy all environment variables except the one we're setting
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			result = append(result, e)
+		}
+	}
+
+	// Add our variable at the end
+	result = append(result, prefix+value)
+	return result
+}
+
 func reload(mainPackage string, modelData []byte) error {
 	goPath, err := exec.LookPath("go")
 	if err != nil {
@@ -205,7 +223,9 @@ func reload(mainPackage string, modelData []byte) error {
 	}
 
 	encodedModelData := base64.StdEncoding.EncodeToString(modelData)
-	err = syscall.Exec(goPath, append(args, mainPackage), append(os.Environ(), fmt.Sprintf("RESTEEP_MODEL=%s", encodedModelData)))
+	env := os.Environ()
+	env = setEnvVar(env, "RESTEEP_MODEL", encodedModelData)
+	err = syscall.Exec(goPath, append(args, mainPackage), env)
 	if err != nil {
 		return fmt.Errorf("exec failed: %w", err)
 	}
