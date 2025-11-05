@@ -52,6 +52,12 @@ func Resteep(run func(state []byte, stateCh chan<- []byte) error) error {
 }
 
 func supervisor() error {
+	originalTermState, err := term.GetState(int(os.Stdin.Fd()))
+	if err != nil {
+		return fmt.Errorf("failed to get terminal state: %w", err)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), originalTermState)
+
 	root, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("failed to get working directory: %w", err)
@@ -195,11 +201,15 @@ func supervisor() error {
 					if errno != 0 {
 						log.Printf("Warning: failed to reclaim foreground: %v", errno)
 					}
+
+					term.Restore(int(os.Stdin.Fd()), originalTermState)
 				}
 
 				cmd = nil // Break to outer loop to restart
 
 			case err := <-exitCh:
+				term.Restore(int(os.Stdin.Fd()), originalTermState)
+
 				// Child process exited naturally
 				var exitCode int
 				if exitErr, ok := err.(*exec.ExitError); ok {
