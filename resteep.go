@@ -97,6 +97,11 @@ func supervisor() error {
 	// Create the message channel once, outside the loop
 	msgCh := msgChanFromReader(r)
 
+	// Signal channel for Ctrl-C when no child is running
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
 	// Cleanup function to kill the child process and its descendants
 	cleanUpChild := func() {
 		if cmd != nil && cmd.Process != nil {
@@ -195,14 +200,33 @@ func supervisor() error {
 				cmd = nil // Break to outer loop to restart
 
 			case err := <-exitCh:
-				// Child process exited, exit supervisor with same exit code
+				// Child process exited naturally
+				var exitCode int
 				if exitErr, ok := err.(*exec.ExitError); ok {
-					os.Exit(exitErr.ExitCode())
-				}
-				if err != nil {
+					exitCode = exitErr.ExitCode()
+				} else if err != nil {
 					return fmt.Errorf("subprocess failed: %w", err)
 				}
-				return nil // Clean exit
+
+				// Reclaim foreground so we can receive Ctrl-C
+				if isTerminal {
+					signal.Ignore(syscall.SIGTTOU)
+					supervisorPgid := syscall.Getpgrp()
+					syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(), syscall.TIOCSPGRP, uintptr(unsafe.Pointer(&supervisorPgid)))
+					signal.Reset(syscall.SIGTTOU)
+				}
+
+				fmt.Printf("\n\nProcess exited with code %d.\nPress Ctrl-C to exit or save a file to reload.\n", exitCode)
+
+				// Wait for either file change or Ctrl-C
+				select {
+				case <-changeCh:
+					// File changed, restart child (break to outer loop)
+					cmd = nil
+				case <-sigCh:
+					// Ctrl-C pressed, exit supervisor
+					return nil
+				}
 			}
 		}
 	}
