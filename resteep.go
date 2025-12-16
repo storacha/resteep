@@ -87,12 +87,14 @@ func supervisor() error {
 
 	args := []string{"run"}
 
-	// Preserve build tags
+	// Preserve build flags
 	info, ok := debug.ReadBuildInfo()
 	if ok {
 		for _, setting := range info.Settings {
-			if setting.Key == "-tags" {
-				args = append(args, "-tags", setting.Value)
+			// Build settings are either flags, which start with "-", or environment
+			// variables which are inherited automatically.
+			if strings.HasPrefix(setting.Key, "-") {
+				args = append(args, setting.Key, setting.Value)
 			}
 		}
 	}
