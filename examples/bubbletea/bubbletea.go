@@ -31,24 +31,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	return "Hello, World!\n\n" + m.text + "\n\nPress ctrl-c to quit.\n"
-}
-
-func (m model) Marshal() ([]byte, error) {
-	return []byte(m.text), nil
+	return "Type some text below:\n\n> " + m.text + "\n\nNow change this text in bubbletea.go and see it update here.\n\nPress ctrl-c to quit.\n"
 }
 
 func main() {
-	_, err := resteep.Resteep(
-		func(b []byte) resteep.ResteepableModel {
-			if b == nil {
-				return model{}
-			}
-			return model{text: string(b)}
-		},
-		tea.WithAltScreen(),
+	err := resteep.Resteep(
+		resteep.RunBubbleTea(
+			func(state []byte) (model, error) {
+				var m model
+				if state != nil {
+					m.text = string(state)
+				}
+				return m, nil
+			},
+			func(m model) ([]byte, error) {
+				return []byte(m.text), nil
+			},
+			tea.WithAltScreen(),
+		),
 	)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalln(err)
 	}
 }

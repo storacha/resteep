@@ -2,131 +2,302 @@ package resteep
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
+	"unsafe"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/x/term"
 	"github.com/fsnotify/fsnotify"
+	"golang.org/x/term"
 )
 
-type ResteepableModel interface {
-	tea.Model
-	Marshal() ([]byte, error)
-}
+func Resteep(run func(state []byte, stateCh chan<- []byte) error) error {
+	stateB64, hasData := os.LookupEnv("RESTEEP_STATE")
 
-type reloadMsg struct{}
-
-type wrapperModel struct {
-	inner             ResteepableModel
-	mainPackage       string
-	input             *os.File
-	previousTermState *term.State
-}
-
-func (m wrapperModel) Init() tea.Cmd {
-	return m.inner.Init()
-}
-
-func (m wrapperModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg.(type) {
-	case reloadMsg:
-		modelData, err := m.inner.Marshal()
-		if err != nil {
-			panic(fmt.Sprintf("failed to marshal model: %v", err))
-		}
-
-		term.Restore(os.Stdin.Fd(), m.previousTermState)
-		if err := reload(m.mainPackage, modelData); err != nil {
-			panic(fmt.Sprintf("failed to reload: %v", err))
-		}
-
-		return nil, nil // never reached
+	if !hasData {
+		return supervisor()
 	}
 
-	newInner, cmd := m.inner.Update(msg)
-	m.inner = newInner.(ResteepableModel)
-	return m, cmd
-}
+	// Otherwise, we're the subprocess
 
-func (m wrapperModel) View() string {
-	return m.inner.View()
-}
-
-func Resteep(createModel func([]byte) ResteepableModel, opts ...tea.ProgramOption) (tea.Model, error) {
-	mainPackage := getMainPackage()
-
-	var model ResteepableModel
-	if os.Getenv("RESTEEP_MODEL") == "" {
-		model = createModel(nil)
-	} else {
-		data, err := base64.StdEncoding.DecodeString(os.Getenv("RESTEEP_MODEL"))
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode RESTEEP_MODEL: %w", err)
-		}
-		model = createModel(data)
-	}
-
-	// We're assuming stdin is a tty here. Bubble Tea is more flexible than that,
-	// but we're not handling that yet.
-	input := os.Stdin
-
-	// Save the current terminal state so we can restore it just before reloading.
-	// Bubble Tea will restore state itself on exit, but allowing the Bubble Tea
-	// program to completely exit is too slow, and causes a flicker.
-	previousTermState, err := term.GetState(input.Fd())
+	state, err := base64.StdEncoding.DecodeString(stateB64)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get terminal state: %w", err)
+		return fmt.Errorf("failed to decode RESTEEP_STATE: %w", err)
 	}
 
-	program := tea.NewProgram(
-		wrapperModel{
-			inner:             model,
-			mainPackage:       mainPackage,
-			input:             input,
-			previousTermState: previousTermState,
-		},
-		opts...,
-	)
+	// Open fd 3 for writing state updates back to supervisor
+	statePipe := os.NewFile(3, "statepipe")
+	if statePipe == nil {
+		return fmt.Errorf("failed to open fd 3 for state updates")
+	}
+
+	stateCh := msgChanFromWriter(statePipe)
+	defer close(stateCh)
+
+	err = run(state, stateCh)
+	if err != nil {
+		return fmt.Errorf("failed to run: %w", err)
+	}
+
+	return nil
+}
+
+func supervisor() error {
+	originalTermState, err := term.GetState(int(os.Stdin.Fd()))
+	if err != nil {
+		return fmt.Errorf("failed to get terminal state: %w", err)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), originalTermState)
 
 	root, err := os.Getwd()
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to get working directory: %w", err)
 	}
 
-	closeWatcher, err := watchGoFilesInDir(root, func() error {
-		program.Send(reloadMsg{})
-		return nil
-	})
+	changeCh, closeWatcher, err := watchGoFilesInDir(root)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to watch go files in dir: %w", err)
 	}
 	defer closeWatcher()
 
-	finalModel, err := program.Run()
+	// Create a new pipe for custom communication
+	// This pipe lives for the entire supervisor lifetime, so we don't close it
+	// explicitly.
+	r, w, err := os.Pipe()
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to create pipe: %w", err)
 	}
 
-	return finalModel.(wrapperModel).inner, nil
+	goPath, err := exec.LookPath("go")
+	if err != nil {
+		return fmt.Errorf("go not found in PATH: %w", err)
+	}
+
+	// Check if stdin is a terminal for foreground process group management
+	isTerminal := term.IsTerminal(int(os.Stdin.Fd()))
+
+	args := []string{"run"}
+
+	// Preserve build tags
+	info, ok := debug.ReadBuildInfo()
+	if ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "-tags" {
+				args = append(args, "-tags", setting.Value)
+			}
+		}
+	}
+
+	var currentState []byte
+	var cmd *exec.Cmd
+
+	// Create the message channel once, outside the loop
+	msgCh := msgChanFromReader(r)
+
+	// Signal channel for Ctrl-C when no child is running
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	// Cleanup function to kill the child process and its descendants
+	cleanUpChild := func() {
+		if cmd != nil && cmd.Process != nil {
+			// Kill the entire process group
+			pgid, err := syscall.Getpgid(cmd.Process.Pid)
+			if err == nil {
+				// Send SIGKILL first for graceful shutdown
+				err := syscall.Kill(-pgid, syscall.SIGKILL)
+				if err != nil {
+					log.Printf("Failed to send SIGKILL to process group: %v", err)
+				}
+			} else {
+				// Fallback to killing just the process
+				cmd.Process.Signal(syscall.SIGKILL)
+			}
+			// Note: Don't call cmd.Wait() here - the exitCh goroutine will handle it
+		}
+	}
+
+	// Ensure cleanup happens when supervisor exits
+	defer cleanUpChild()
+
+	for {
+		cmd = exec.Command(goPath, append(args, getMainPackage())...)
+
+		encodedData := base64.StdEncoding.EncodeToString(currentState)
+		cmd.Env = setEnvVar(os.Environ(), "RESTEEP_STATE", encodedData)
+
+		// Inherit standard streams
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		// Pass the write end as fd 3
+		cmd.ExtraFiles = []*os.File{w}
+
+		// Set process group ID so we can kill the entire group
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setpgid: true,
+		}
+
+		err = cmd.Start()
+		if err != nil {
+			return fmt.Errorf("failed to start subprocess: %w", err)
+		}
+
+		// Transfer terminal foreground control to the child process group
+		if isTerminal {
+			pgid, err := syscall.Getpgid(cmd.Process.Pid)
+			if err == nil {
+				// Make the child's process group the foreground process group
+				// This allows it to receive terminal signals (Ctrl-C, etc.)
+				_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(), syscall.TIOCSPGRP, uintptr(unsafe.Pointer(&pgid)))
+				if errno != 0 {
+					log.Printf("Warning: failed to set foreground process group: %v", errno)
+				}
+			} else {
+				log.Printf("Failed to get child pgid: %v", err)
+			}
+		}
+
+		// Wait for child to exit in a goroutine
+		exitCh := make(chan error, 1)
+		go func() {
+			exitCh <- cmd.Wait()
+		}()
+
+		for cmd != nil {
+			select {
+			case msgData, ok := <-msgCh:
+				if !ok {
+					return fmt.Errorf("subprocess pipe closed unexpectedly")
+				}
+				currentState = msgData
+
+			case _ = <-changeCh:
+				// Kill the subprocess and its descendants
+				cleanUpChild()
+				// Wait for the process to fully exit
+				<-exitCh
+
+				// Reclaim terminal foreground before starting new child
+				// We need to ignore SIGTTOU while doing this, otherwise we'll be suspended
+				if isTerminal {
+					// Temporarily ignore SIGTTOU so we can manipulate terminal foreground
+					signal.Ignore(syscall.SIGTTOU)
+					defer signal.Reset(syscall.SIGTTOU)
+
+					supervisorPgid := syscall.Getpgrp()
+					_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(), syscall.TIOCSPGRP, uintptr(unsafe.Pointer(&supervisorPgid)))
+					if errno != 0 {
+						log.Printf("Warning: failed to reclaim foreground: %v", errno)
+					}
+
+					term.Restore(int(os.Stdin.Fd()), originalTermState)
+				}
+
+				cmd = nil // Break to outer loop to restart
+
+			case err := <-exitCh:
+				term.Restore(int(os.Stdin.Fd()), originalTermState)
+
+				// Child process exited naturally
+				var exitCode int
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					exitCode = exitErr.ExitCode()
+				} else if err != nil {
+					return fmt.Errorf("subprocess failed: %w", err)
+				}
+
+				// Reclaim foreground so we can receive Ctrl-C
+				if isTerminal {
+					signal.Ignore(syscall.SIGTTOU)
+					supervisorPgid := syscall.Getpgrp()
+					syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(), syscall.TIOCSPGRP, uintptr(unsafe.Pointer(&supervisorPgid)))
+					signal.Reset(syscall.SIGTTOU)
+				}
+
+				fmt.Printf("\n\nProcess exited with code %d.\nPress Ctrl-C to exit or save a file to reload.\n", exitCode)
+
+				// Wait for either file change or Ctrl-C
+				select {
+				case <-changeCh:
+					// File changed, restart child (break to outer loop)
+					cmd = nil
+				case <-sigCh:
+					// Ctrl-C pressed, exit supervisor
+					return nil
+				}
+			}
+		}
+	}
 }
 
-func watchGoFilesInDir(dir string, cb func() error) (func() error, error) {
+func msgChanFromWriter(w io.WriteCloser) chan<- []byte {
+	ch := make(chan []byte, 1)
+
+	go func() {
+		defer w.Close()
+		for newState := range ch {
+			// Write length prefix (4 bytes, big endian)
+			length := uint32(len(newState))
+			if err := binary.Write(w, binary.BigEndian, length); err != nil {
+				return
+			}
+			// Write state data
+			if _, err := w.Write(newState); err != nil {
+				return
+			}
+		}
+	}()
+
+	return ch
+}
+
+func msgChanFromReader(r io.Reader) <-chan []byte {
+	ch := make(chan []byte)
+
+	go func() {
+		defer close(ch)
+		for {
+			var length uint32
+			err := binary.Read(r, binary.BigEndian, &length)
+			if err != nil {
+				log.Printf("Failed to read state length: %v", err)
+				return
+			}
+			opaqueData := make([]byte, length)
+			_, err = io.ReadFull(r, opaqueData)
+			if err != nil {
+				return
+			}
+			ch <- opaqueData
+		}
+	}()
+
+	return ch
+}
+
+func watchGoFilesInDir(dir string) (<-chan fsnotify.Event, func() error, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := addDirs(watcher, dir); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	changeCh := make(chan fsnotify.Event)
 
 	go func() {
 		for {
@@ -135,12 +306,9 @@ func watchGoFilesInDir(dir string, cb func() error) (func() error, error) {
 				if !ok {
 					return
 				}
-
 				// Check if it's a .go file
 				if filepath.Ext(event.Name) == ".go" && (event.Op.Has(fsnotify.Write) || event.Op.Has(fsnotify.Create) || event.Op.Has(fsnotify.Remove)) {
-					if err := cb(); err != nil {
-						log.Println("Error reloading:", err)
-					}
+					changeCh <- event
 				}
 
 				// If a new directory was created, watch it too
@@ -154,12 +322,12 @@ func watchGoFilesInDir(dir string, cb func() error) (func() error, error) {
 				if !ok {
 					return
 				}
-				log.Fatal("Error:", err)
+				log.Printf("Watcher error: %v", err)
 			}
 		}
 	}()
 
-	return watcher.Close, nil
+	return changeCh, watcher.Close, nil
 }
 
 // addDirs adds all directories under root to the watcher, skipping hidden dirs
@@ -204,37 +372,8 @@ func setEnvVar(env []string, key, value string) []string {
 	return result
 }
 
-func reload(mainPackage string, modelData []byte) error {
-	goPath, err := exec.LookPath("go")
-	if err != nil {
-		return fmt.Errorf("go not found in PATH: %w", err)
-	}
-
-	args := []string{"go", "run"}
-
-	// Preserve build tags
-	info, ok := debug.ReadBuildInfo()
-	if ok {
-		for _, setting := range info.Settings {
-			if setting.Key == "-tags" {
-				args = append(args, "-tags", setting.Value)
-			}
-		}
-	}
-
-	encodedModelData := base64.StdEncoding.EncodeToString(modelData)
-	env := os.Environ()
-	env = setEnvVar(env, "RESTEEP_MODEL", encodedModelData)
-	err = syscall.Exec(goPath, append(args, mainPackage), env)
-	if err != nil {
-		return fmt.Errorf("exec failed: %w", err)
-	}
-
-	return nil // never reached
-}
-
 // getMainPackage returns the directory containing the main function at the top
-// of the call stack. This must be
+// of the call stack. This must be called from the main goroutine.
 func getMainPackage() string {
 	pcs := make([]uintptr, 10)
 	n := runtime.Callers(0, pcs)
