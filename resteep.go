@@ -122,8 +122,12 @@ func supervisor() error {
 					log.Printf("Failed to send SIGKILL to process group: %v", err)
 				}
 			} else {
+				log.Printf("Error sending SIGKILL: %v", err)
 				// Fallback to killing just the process
-				cmd.Process.Signal(syscall.SIGKILL)
+				err := cmd.Process.Signal(syscall.SIGKILL)
+				if err != nil {
+					log.Printf("Failed to kill subprocess: %v", err)
+				}
 			}
 			// Note: Don't call cmd.Wait() here - the exitCh goroutine will handle it
 		}
@@ -146,7 +150,8 @@ func supervisor() error {
 		// Pass the write end as fd 3
 		cmd.ExtraFiles = []*os.File{w}
 
-		// Set process group ID so we can kill the entire group
+		// Start a new process group for the child so it receives terminal signals
+		// separately from the supervisor
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Setpgid: true,
 		}
@@ -175,6 +180,7 @@ func supervisor() error {
 		exitCh := make(chan error, 1)
 		go func() {
 			exitCh <- cmd.Wait()
+			cmd = nil
 		}()
 
 		for cmd != nil {
@@ -210,6 +216,14 @@ func supervisor() error {
 				cmd = nil // Break to outer loop to restart
 
 			case err := <-exitCh:
+				// Reclaim foreground before we interact with the terminal at all
+				if isTerminal {
+					signal.Ignore(syscall.SIGTTOU)
+					supervisorPgid := syscall.Getpgrp()
+					syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(), syscall.TIOCSPGRP, uintptr(unsafe.Pointer(&supervisorPgid)))
+					signal.Reset(syscall.SIGTTOU)
+				}
+
 				term.Restore(int(os.Stdin.Fd()), originalTermState)
 
 				// Child process exited naturally
@@ -218,14 +232,6 @@ func supervisor() error {
 					exitCode = exitErr.ExitCode()
 				} else if err != nil {
 					return fmt.Errorf("subprocess failed: %w", err)
-				}
-
-				// Reclaim foreground so we can receive Ctrl-C
-				if isTerminal {
-					signal.Ignore(syscall.SIGTTOU)
-					supervisorPgid := syscall.Getpgrp()
-					syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(), syscall.TIOCSPGRP, uintptr(unsafe.Pointer(&supervisorPgid)))
-					signal.Reset(syscall.SIGTTOU)
 				}
 
 				fmt.Printf("\n\nProcess exited with code %d.\nPress Ctrl-C to exit or save a file to reload.\n", exitCode)
