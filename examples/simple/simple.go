@@ -12,8 +12,6 @@ import (
 func main() {
 	err := resteep.Resteep(
 		func(state []byte, stateCh chan<- []byte) error {
-			log.Fatalln("test error")
-
 			num := 0
 
 			if len(state) == 4 {
@@ -21,7 +19,7 @@ func main() {
 			}
 
 			for {
-				fmt.Printf("Current state: %d\n", num)
+				fmt.Printf("\rCurrent state: %d", num)
 				num++
 				buf := make([]byte, 4)
 				binary.BigEndian.PutUint32(buf, uint32(num))
@@ -32,7 +30,6 @@ func main() {
 		},
 	)
 	if err != nil {
-		fmt.Printf("err1")
 		log.Fatalln(err)
 	}
 }
